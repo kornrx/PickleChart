@@ -6,7 +6,11 @@
   "scripts": {
     "dev": "vite",
     "build": "tsc && vite build",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "paper": "tsx server/index.ts",
+    "backtest": "tsx server/backtest.ts",
+    "typecheck": "tsc --noEmit && tsc -p tsconfig.server.json",
+    "selftest": "tsx server/selftest.ts"
   },
   "dependencies": {
     "clsx": "^2.1.1",
@@ -16,13 +20,17 @@
     "tailwind-merge": "^3.0.1"
   },
   "devDependencies": {
+    "@types/node": "^26.6.2",
     "@types/react": "^18.3.18",
     "@types/react-dom": "^18.3.5",
+    "@types/ws": "^8.18.1",
     "@vitejs/plugin-react": "^4.3.4",
     "autoprefixer": "^10.4.20",
     "postcss": "^8.5.1",
     "tailwindcss": "^3.4.17",
+    "tsx": "^4.23.15",
     "typescript": "^5.7.3",
-    "vite": "^6.1.0"
+    "vite": "^6.1.0",
+    "ws": "^8.21.3"
   }
 }
