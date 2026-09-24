@@ -32,8 +32,12 @@ export class RiskManager {
   private state: RiskState;
   private lastLossAt = new Map<string, number>();
 
-  constructor(cfg: RiskConfig, startingEquity: number, now = Date.now()) {
+  /** Round-trip taker cost in basis points, used by the fee gate. */
+  private roundTripFeeBps: number;
+
+  constructor(cfg: RiskConfig, startingEquity: number, roundTripFeeBps = 10, now = Date.now()) {
     this.cfg = cfg;
+    this.roundTripFeeBps = roundTripFeeBps;
     this.state = {
       killSwitch: false,
       peakEquity: startingEquity,
@@ -110,9 +114,22 @@ export class RiskManager {
     const riskAmount = ctx.equity * this.cfg.riskPerTrade;
     let qty = riskAmount / riskPerUnit;
 
-    // Never let a wide stop turn into an oversized notional.
+    // Never let a tight stop turn into an oversized notional. When this binds it
+    // does not merely shrink the trade: notional stays at the ceiling, so fees
+    // stay at full size while the risk being taken collapses. That is a
+    // different trade from the one the strategy asked for, so refuse it.
     const maxQty = (ctx.equity * this.cfg.maxLeverage) / ctx.price;
-    qty = Math.min(qty, maxQty);
+    if (qty > maxQty) {
+      const cappedRisk = maxQty * riskPerUnit;
+      if (cappedRisk < riskAmount * this.cfg.minRiskAfterCap) {
+        return {
+          approved: false,
+          qty: 0,
+          rejectedBy: `leverage cap guts the trade (risk ${cappedRisk.toFixed(2)} of ${riskAmount.toFixed(2)} USDT)`,
+        };
+      }
+      qty = maxQty;
+    }
 
     const step = QTY_STEP[signal.symbol] ?? 0.001;
     qty = Math.floor(qty / step) * step;
@@ -123,6 +140,18 @@ export class RiskManager {
     }
     if (qty * ctx.price < this.cfg.minNotional) {
       return { approved: false, qty: 0, rejectedBy: `below min notional (${this.cfg.minNotional} USDT)` };
+    }
+
+    // The trade has to be worth its own cost. A target a few ticks away on a
+    // large notional loses to fees however well the entry was timed.
+    const roundTripFee = qty * ctx.price * (this.roundTripFeeBps / 10_000);
+    const expectedProfit = Math.abs(signal.takeProfit - ctx.price) * qty;
+    if (expectedProfit < this.cfg.minRewardToFee * roundTripFee) {
+      return {
+        approved: false,
+        qty: 0,
+        rejectedBy: `reward ${expectedProfit.toFixed(2)} below ${this.cfg.minRewardToFee}x fees (${roundTripFee.toFixed(2)} USDT)`,
+      };
     }
 
     return { approved: true, qty, riskAmount };

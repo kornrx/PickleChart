@@ -33,6 +33,19 @@ export interface RiskConfig {
   minNotional: number;
   /** Cool-off after a losing trade before the same symbol may be re-entered. */
   cooldownMs: number;
+  /**
+   * Expected profit must be at least this multiple of the round-trip fee.
+   * Without it, a tight stop plus the leverage cap produces trades whose cost
+   * dwarfs the risk taken — mathematically unwinnable regardless of edge.
+   */
+  minRewardToFee: number;
+  /**
+   * Smallest share of the intended risk a capped trade may still carry. The
+   * leverage cap shrinks size but not notional, so fees stay at full size while
+   * risk falls; below this share the trade is no longer the one the strategy
+   * asked for. A mild trim is fine — a collapse to a few percent is not.
+   */
+  minRiskAfterCap: number;
 }
 
 export const DEFAULT_CONFIG: TradingConfig = {
@@ -50,6 +63,8 @@ export const DEFAULT_CONFIG: TradingConfig = {
     maxDrawdown: 0.15,
     minNotional: 5,
     cooldownMs: 60_000,
+    minRewardToFee: 1.5,
+    minRiskAfterCap: 0.5,
   },
   db: { path: 'data/picklechart.db' },
   ws: { port: 8787 },
@@ -72,6 +87,7 @@ export function loadConfig(): TradingConfig {
   c.risk.riskPerTrade = num(process.env.PC_RISK_PER_TRADE, c.risk.riskPerTrade);
   c.risk.maxDailyLoss = num(process.env.PC_MAX_DAILY_LOSS, c.risk.maxDailyLoss);
   c.risk.maxDrawdown = num(process.env.PC_MAX_DRAWDOWN, c.risk.maxDrawdown);
+  c.risk.minRewardToFee = num(process.env.PC_MIN_REWARD_TO_FEE, c.risk.minRewardToFee);
   c.db.path = process.env.PC_DB ?? c.db.path;
   c.ws.port = num(process.env.PC_WS_PORT, c.ws.port);
 

@@ -10,7 +10,8 @@
     "paper": "tsx server/index.ts",
     "backtest": "tsx server/backtest.ts",
     "typecheck": "tsc --noEmit && tsc -p tsconfig.server.json",
-    "selftest": "tsx server/selftest.ts"
+    "selftest": "tsx server/selftest.ts",
+    "diagnose": "tsx server/diagnose.ts"
   },
   "dependencies": {
     "clsx": "^2.1.1",

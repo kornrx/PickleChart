@@ -194,12 +194,58 @@ test('size is set by risk per trade divided by stop distance', () => {
   near(d.qty, 10);
 });
 
-test('size is capped by max leverage', () => {
+test('a cap that guts the risk rejects the trade', () => {
   const r = new RiskManager(DEFAULT_CONFIG.risk, 10_000);
   r.update(10_000, 1_000);
-  // A 0.01 stop would ask for 5,000 units; 5x leverage on 10k at 3,300 allows ~15.15
+  // A 0.01 stop asks for 5,000 units; 5x leverage on 10k at 3,300 allows ~15.15,
+  // leaving about 0.15 USDT of risk against full-size fees.
   const d = r.evaluate(signal(3_299.99), { equity: 10_000, openPositions: 0, price: 3_300, now: 1_000 });
-  assert.ok(d.qty * 3_300 <= 10_000 * DEFAULT_CONFIG.risk.maxLeverage + 1, `notional ${d.qty * 3_300} exceeds cap`);
+  assert.equal(d.approved, false);
+  assert.match(d.rejectedBy!, /leverage cap guts the trade/);
+});
+
+test('a cap that merely trims the size is allowed through', () => {
+  const r = new RiskManager(DEFAULT_CONFIG.risk, 10_000, 10);
+  r.update(10_000, 1_000);
+  // Stop 3.60 away asks for 13.9 units; the cap allows 15.15, so this does not
+  // bind at all — and a 3.30 stop trims risk to ~92%, still well over half.
+  const d = r.evaluate(
+    { ...signal(3_296.7), takeProfit: 3_340 },
+    { equity: 10_000, openPositions: 0, price: 3_300, now: 1_000 }
+  );
+  assert.equal(d.approved, true);
+});
+
+test('still sizes normally when the cap does not bind', () => {
+  const r = new RiskManager(DEFAULT_CONFIG.risk, 10_000);
+  r.update(10_000, 1_000);
+  const d = r.evaluate(signal(3_295), { equity: 10_000, openPositions: 0, price: 3_300, now: 1_000 });
+  assert.equal(d.approved, true);
+  assert.ok(d.qty * 3_300 <= 10_000 * DEFAULT_CONFIG.risk.maxLeverage);
+});
+
+test('a target that cannot cover its own fees is refused', () => {
+  const r = new RiskManager({ ...DEFAULT_CONFIG.risk, minRewardToFee: 3 }, 10_000, 10);
+  r.update(10_000, 1_000);
+  // 10 units at 3,300 = 33,000 notional, so round-trip fees are 33 USDT.
+  // A 0.50 target pays 5 USDT — well under the 3x floor.
+  const d = r.evaluate(
+    { ...signal(3_295), takeProfit: 3_300.5 },
+    { equity: 10_000, openPositions: 0, price: 3_300, now: 1_000 }
+  );
+  assert.equal(d.approved, false);
+  assert.match(d.rejectedBy!, /below 3x fees/);
+});
+
+test('a target that clears the fee floor is allowed', () => {
+  const r = new RiskManager(DEFAULT_CONFIG.risk, 10_000, 10);
+  r.update(10_000, 1_000);
+  // 10 units, 33 USDT of fees; a 15-point target pays 150 USDT.
+  const d = r.evaluate(
+    { ...signal(3_295), takeProfit: 3_315 },
+    { equity: 10_000, openPositions: 0, price: 3_300, now: 1_000 }
+  );
+  assert.equal(d.approved, true);
 });
 
 test('entries are refused at the max open position count', () => {
@@ -301,8 +347,11 @@ test('fires a long after a sell-side sweep is reclaimed with buyers in control',
   assert.equal(signal!.direction, 'long');
   // Stop sits below the deepest price the sweep reached (3,298), plus buffer.
   assert.ok(signal!.stopLoss < 3_298, `stop ${signal!.stopLoss} must sit under the sweep extreme`);
-  assert.equal(signal!.takeProfit, 3_312); // the un-swept BSL pool above
-  assert.ok(signal!.detail!.targetFromPool === true);
+  // The BSL pool at 3,312 is only 10 away against a 13.2 cost floor, so the
+  // target steps past it rather than aiming at a fee-sized move.
+  const fee = 3_302 * 0.001;
+  assert.ok(signal!.takeProfit >= 3_302 + 4 * fee, `target ${signal!.takeProfit} must clear the cost floor`);
+  assert.equal(signal!.detail!.targetFromPool, false);
 });
 
 test('mirrors the setup for shorts', () => {
@@ -319,7 +368,24 @@ test('mirrors the setup for shorts', () => {
   assert.ok(signal, 'expected a short signal');
   assert.equal(signal!.direction, 'short');
   assert.ok(signal!.stopLoss > 3_302, 'stop must sit above the sweep extreme');
-  assert.equal(signal!.takeProfit, 3_288);
+  const fee = 3_298 * 0.001;
+  assert.ok(signal!.takeProfit <= 3_298 - 4 * fee, `target ${signal!.takeProfit} must clear the cost floor`);
+});
+
+test('a matured sweep is not hidden by a fresher un-reclaimed one', () => {
+  // On a busy book a new sweep lands every few seconds. The older one here has
+  // been reclaimed and is a valid setup; the newer one has not.
+  const ctx = longSetupContext({
+    sweptEvents: [
+      { id: 'old', time: 990_000, price: 3_300, type: 'ssl_swept', volume: 50,
+        notional: 165_000, aggressorSide: 'sell', reaction: 'absorbed_reversal', lowAfterSweep: 3_298 },
+      { id: 'fresh', time: 999_500, price: 3_303, type: 'ssl_swept', volume: 50,
+        notional: 165_000, aggressorSide: 'sell', reaction: 'absorbed_reversal', lowAfterSweep: 3_302 },
+    ],
+  });
+  const signal = new SweepReversalStrategy().evaluateEntry(ctx);
+  assert.ok(signal, 'the reclaimed sweep should still produce a signal');
+  assert.equal(signal!.detail!.sweepId, 'old');
 });
 
 test('stands aside when price has not reclaimed the swept level', () => {
@@ -343,6 +409,21 @@ test('stands aside when the book is fighting the setup', () => {
   assert.equal(s.evaluateEntry(ctx), null);
 });
 
+test('the sweep floor follows the symbol, not one global figure', () => {
+  const s = new SweepReversalStrategy();
+  assert.equal(s.sweepFloorFor('BTCUSDT'), 25_000);
+  assert.equal(s.sweepFloorFor('XAUUSDT'), 4_000);
+});
+
+test('a gold sweep that BTC thresholds would have silenced still fires', () => {
+  const s = new SweepReversalStrategy();
+  const ctx = longSetupContext({
+    sweptEvents: [{ id: 's4', time: 995_000, price: 3_300, type: 'ssl_swept', volume: 3,
+      notional: 9_900, aggressorSide: 'sell', reaction: 'absorbed_reversal', lowAfterSweep: 3_298 }],
+  });
+  assert.ok(s.evaluateEntry(ctx), 'a 9.9k sweep clears the gold floor of 4k');
+});
+
 test('stands aside on a small sweep', () => {
   const s = new SweepReversalStrategy();
   const ctx = longSetupContext({
@@ -352,13 +433,34 @@ test('stands aside on a small sweep', () => {
   assert.equal(s.evaluateEntry(ctx), null);
 });
 
-test('stands aside when the target is too close to justify the risk', () => {
+test('a pool inside the cost floor is looked past, not aimed at', () => {
   const s = new SweepReversalStrategy();
   const ctx = longSetupContext({
     liquidityPools: [{ id: 'p3', price: 3_303, type: 'BSL', description: 'near highs', time: 940_000,
       estimatedVolume: 100, isSwept: false, distance: 1 }],
   });
-  assert.equal(s.evaluateEntry(ctx), null); // ~1 point of reward against ~5.5 of risk
+  const signal = s.evaluateEntry(ctx);
+  assert.ok(signal, 'the setup is still valid; only the target moves');
+  // A 1-point target against a 3.30 round trip would hand the whole move to fees.
+  assert.ok(signal!.takeProfit > 3_310, `target ${signal!.takeProfit} still inside the cost floor`);
+  assert.equal(signal!.detail!.targetFromPool, false);
+});
+
+test('the stop is never tighter than the round-trip cost', () => {
+  const s = new SweepReversalStrategy();
+  // A sweep that barely dipped leaves a stop a few ticks away — inside the noise.
+  const ctx = longSetupContext({
+    sweptEvents: [{ id: 's5', time: 995_000, price: 3_300, type: 'ssl_swept', volume: 50,
+      notional: 165_000, aggressorSide: 'sell', reaction: 'absorbed_reversal', lowAfterSweep: 3_301.5 }],
+    recentTrades: [{ id: '1', time: 996_000, price: 3_301.5, qty: 5, side: 'sell' }],
+  });
+  const signal = s.evaluateEntry(ctx);
+  assert.ok(signal, 'expected a signal');
+  const fee = 3_302 * 0.001;
+  assert.ok(
+    Math.abs(3_302 - signal!.stopLoss) >= 1.5 * fee - 1e-9,
+    `stop distance ${Math.abs(3_302 - signal!.stopLoss)} is inside the cost floor`
+  );
 });
 
 test('stands aside when the spread is too wide', () => {
@@ -380,14 +482,16 @@ test('moves the stop to break-even once the trade is 1R onside', () => {
     },
   });
   const exit = s.evaluateExit!(ctx);
-  assert.equal(exit?.newStopLoss, 3_302);
+  // Break-even has to clear the round trip, or being tagged there costs the fee.
+  assert.ok(exit?.newStopLoss != null && exit.newStopLoss > 3_302, 'stop must sit above entry, not at it');
+  assert.ok(Math.abs(exit!.newStopLoss! - (3_302 + 3_310 * 0.001)) < 1e-6);
   assert.ok(!exit?.close);
 });
 
 test('abandons a trade that has run past the max hold time', () => {
   const s = new SweepReversalStrategy();
   const ctx = longSetupContext({
-    now: 990_000 + 20 * 60_000,
+    now: 990_000 + 100 * 60_000,
     position: {
       symbol: 'XAUUSDT', direction: 'long', qty: 1, entryPrice: 3_302, entryTs: 990_000,
       stopLoss: 3_297, takeProfit: 3_312, entryFee: 0, unrealizedPnl: 0,

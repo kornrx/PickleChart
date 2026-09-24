@@ -66,7 +66,7 @@ export class TradingEngine {
         onClose: (t) => this.handleClose(t),
       },
     });
-    this.risk = new RiskManager(this.cfg.risk, this.cfg.startingEquity);
+    this.risk = new RiskManager(this.cfg.risk, this.cfg.startingEquity, this.cfg.takerFeeBps * 2);
   }
 
   registerContext(ctx: MarketContext) {

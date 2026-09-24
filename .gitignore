@@ -32,3 +32,6 @@ Thumbs.db
 
 # paper-trading tick database
 data/
+
+# collector logs
+logs/

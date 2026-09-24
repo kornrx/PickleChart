@@ -13,13 +13,22 @@ import { StrategySignal } from './strategy/types';
 export class TradeDatabase {
   private db: DatabaseSync;
   private tradeBuffer: Array<[string, number, number, number, string]> = [];
+  private writeErrors = 0;
+  private lastErrorLog = 0;
+  private onError?: (msg: string) => void;
 
-  constructor(path: string) {
+  constructor(path: string, onError?: (msg: string) => void) {
+    this.onError = onError;
     mkdirSync(dirname(path), { recursive: true });
     this.db = new DatabaseSync(path);
     this.db.exec('PRAGMA journal_mode = WAL');
     this.db.exec('PRAGMA synchronous = NORMAL');
+    // A backtest can run while the live collector is still writing ticks. WAL
+    // allows that, but only one writer at a time — without a busy timeout the
+    // second process fails outright instead of waiting its turn.
+    this.db.exec('PRAGMA busy_timeout = 15000');
     this.migrate();
+    this.rekeyRunScopedTables();
   }
 
   private migrate() {
@@ -61,7 +70,7 @@ export class TradeDatabase {
       );
 
       CREATE TABLE IF NOT EXISTS orders (
-        id TEXT PRIMARY KEY,
+        id TEXT NOT NULL,
         run_id TEXT NOT NULL,
         symbol TEXT NOT NULL,
         ts INTEGER NOT NULL,
@@ -72,12 +81,13 @@ export class TradeDatabase {
         fill_price REAL,
         status TEXT NOT NULL,
         fee REAL NOT NULL DEFAULT 0,
-        reason TEXT
+        reason TEXT,
+        PRIMARY KEY (run_id, id)
       );
       CREATE INDEX IF NOT EXISTS idx_orders_run ON orders(run_id, ts);
 
       CREATE TABLE IF NOT EXISTS closed_trades (
-        id TEXT PRIMARY KEY,
+        id TEXT NOT NULL,
         run_id TEXT NOT NULL,
         symbol TEXT NOT NULL,
         direction TEXT NOT NULL,
@@ -93,7 +103,8 @@ export class TradeDatabase {
         net_pnl REAL NOT NULL,
         r_multiple REAL,
         exit_reason TEXT NOT NULL,
-        entry_reason TEXT
+        entry_reason TEXT,
+        PRIMARY KEY (run_id, id)
       );
       CREATE INDEX IF NOT EXISTS idx_closed_run ON closed_trades(run_id, exit_ts);
 
@@ -121,6 +132,62 @@ export class TradeDatabase {
     `);
   }
 
+  /**
+   * Early databases keyed `orders` and `closed_trades` by id alone. Those ids
+   * restart per run (`o-1`, `t-SYMBOL-entryTs`), so a backtest would collide
+   * with — and silently overwrite — the live run's journal. Rebuild the tables
+   * with the run included in the key.
+   */
+  private rekeyRunScopedTables() {
+    for (const table of ['orders', 'closed_trades']) {
+      const row = this.db
+        .prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name = ?")
+        .get(table) as { sql?: string } | undefined;
+      if (!row?.sql || !row.sql.includes('id TEXT PRIMARY KEY')) continue;
+
+      const created = row.sql
+        .replace('id TEXT PRIMARY KEY', 'id TEXT NOT NULL')
+        .replace(/\)\s*$/, ', PRIMARY KEY (run_id, id))');
+
+      this.db.exec('BEGIN');
+      try {
+        this.db.exec(`ALTER TABLE ${table} RENAME TO ${table}_old`);
+        this.db.exec(created);
+        this.db.exec(`INSERT OR IGNORE INTO ${table} SELECT * FROM ${table}_old`);
+        this.db.exec(`DROP TABLE ${table}_old`);
+        this.db.exec('COMMIT');
+      } catch (err) {
+        this.db.exec('ROLLBACK');
+        throw err;
+      }
+    }
+  }
+
+  /**
+   * Journal writes are best-effort.
+   *
+   * Collecting market data is the job that cannot be redone later — a tick
+   * missed while the feed is live is gone for good. A failed INSERT (a lock
+   * held by a concurrent backtest, a full disk) must not be allowed to take the
+   * collector down with it, so failures are counted and reported, not thrown.
+   */
+  private safeWrite(what: string, fn: () => void) {
+    try {
+      fn();
+    } catch (err) {
+      this.writeErrors++;
+      const now = Date.now();
+      if (now - this.lastErrorLog > 30_000) {
+        this.lastErrorLog = now;
+        this.onError?.(`journal write failed (${what}): ${String(err)} — ${this.writeErrors} total, collection continues`);
+      }
+    }
+  }
+
+  getWriteErrorCount(): number {
+    return this.writeErrors;
+  }
+
   // --- run journal -------------------------------------------------------
 
   startRun(id: string, mode: 'live-paper' | 'backtest', config: unknown, startedAt = Date.now()) {
@@ -143,21 +210,25 @@ export class TradeDatabase {
 
   flushTrades() {
     if (this.tradeBuffer.length === 0) return;
-    const stmt = this.db.prepare('INSERT INTO trades (symbol, ts, price, qty, side) VALUES (?, ?, ?, ?, ?)');
-    this.db.exec('BEGIN');
-    try {
-      for (const row of this.tradeBuffer) stmt.run(...row);
-      this.db.exec('COMMIT');
-    } catch (err) {
-      this.db.exec('ROLLBACK');
-      throw err;
-    }
+    const rows = this.tradeBuffer;
     this.tradeBuffer = [];
+    this.safeWrite('trades', () => {
+      const stmt = this.db.prepare('INSERT INTO trades (symbol, ts, price, qty, side) VALUES (?, ?, ?, ?, ?)');
+      this.db.exec('BEGIN');
+      try {
+        for (const row of rows) stmt.run(...row);
+        this.db.exec('COMMIT');
+      } catch (err) {
+        this.db.exec('ROLLBACK');
+        throw err;
+      }
+    });
   }
 
   insertBookSnapshot(symbol: string, book: OrderBookState) {
-    this.db
-      .prepare(
+    this.safeWrite('book_snapshot', () =>
+      this.db
+        .prepare(
         'INSERT INTO book_snapshots (symbol, ts, best_bid, best_ask, bids_json, asks_json) VALUES (?, ?, ?, ?, ?, ?)'
       )
       .run(
@@ -167,71 +238,77 @@ export class TradeDatabase {
         book.bestAsk,
         JSON.stringify(book.bids.slice(0, 20).map((l) => [l.price, l.qty])),
         JSON.stringify(book.asks.slice(0, 20).map((l) => [l.price, l.qty]))
-      );
+      ));
   }
 
   upsertCandles(symbol: string, tf: string, candles: Candle[]) {
     if (candles.length === 0) return;
-    const stmt = this.db.prepare(`
+    this.safeWrite('candles', () => {
+      const stmt = this.db.prepare(`
       INSERT INTO candles (symbol, tf, time, open, high, low, close, volume, buy_volume, sell_volume)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(symbol, tf, time) DO UPDATE SET
         high = excluded.high, low = excluded.low, close = excluded.close,
         volume = excluded.volume, buy_volume = excluded.buy_volume, sell_volume = excluded.sell_volume
     `);
-    this.db.exec('BEGIN');
-    try {
-      for (const c of candles) {
-        stmt.run(symbol, tf, c.time, c.open, c.high, c.low, c.close, c.volume, c.buyVolume ?? 0, c.sellVolume ?? 0);
+      this.db.exec('BEGIN');
+      try {
+        for (const c of candles) {
+          stmt.run(symbol, tf, c.time, c.open, c.high, c.low, c.close, c.volume, c.buyVolume ?? 0, c.sellVolume ?? 0);
+        }
+        this.db.exec('COMMIT');
+      } catch (err) {
+        this.db.exec('ROLLBACK');
+        throw err;
       }
-      this.db.exec('COMMIT');
-    } catch (err) {
-      this.db.exec('ROLLBACK');
-      throw err;
-    }
+    });
   }
 
   // --- trading journal ---------------------------------------------------
 
   insertOrder(runId: string, o: OrderRecord) {
-    this.db
-      .prepare(
+    this.safeWrite('order', () =>
+      this.db
+        .prepare(
         `INSERT INTO orders (id, run_id, symbol, ts, side, type, qty, price, fill_price, status, fee, reason)
          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-         ON CONFLICT(id) DO UPDATE SET
+         ON CONFLICT(run_id, id) DO UPDATE SET
            fill_price = excluded.fill_price, status = excluded.status, fee = excluded.fee`
       )
-      .run(o.id, runId, o.symbol, o.ts, o.side, o.type, o.qty, o.price ?? null, o.fillPrice ?? null, o.status, o.fee, o.reason ?? null);
+        .run(o.id, runId, o.symbol, o.ts, o.side, o.type, o.qty, o.price ?? null, o.fillPrice ?? null, o.status, o.fee, o.reason ?? null));
   }
 
   insertClosedTrade(runId: string, t: ClosedTrade) {
-    this.db
-      .prepare(
+    this.safeWrite('closed_trade', () =>
+      this.db
+        .prepare(
         `INSERT INTO closed_trades
          (id, run_id, symbol, direction, qty, entry_ts, exit_ts, entry_price, exit_price,
           stop_loss, take_profit, gross_pnl, fees, net_pnl, r_multiple, exit_reason, entry_reason)
          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
       )
-      .run(
+        .run(
         t.id, runId, t.symbol, t.direction, t.qty, t.entryTs, t.exitTs, t.entryPrice, t.exitPrice,
         t.stopLoss ?? null, t.takeProfit ?? null, t.grossPnl, t.fees, t.netPnl, t.rMultiple ?? null,
         t.exitReason, t.entryReason ?? null
-      );
+      ));
   }
 
   insertEquityPoint(runId: string, ts: number, equity: number, realized: number, unrealized: number) {
-    this.db
-      .prepare('INSERT INTO equity_curve (run_id, ts, equity, realized, unrealized) VALUES (?, ?, ?, ?, ?)')
-      .run(runId, ts, equity, realized, unrealized);
+    this.safeWrite('equity', () =>
+      this.db
+        .prepare('INSERT INTO equity_curve (run_id, ts, equity, realized, unrealized) VALUES (?, ?, ?, ?, ?)')
+        .run(runId, ts, equity, realized, unrealized));
   }
 
   insertSignal(runId: string, s: StrategySignal, accepted: boolean, rejectedBy?: string) {
-    this.db
-      .prepare(
+    this.safeWrite('signal', () =>
+      this.db
+        .prepare(
         `INSERT INTO signals (run_id, symbol, ts, direction, reason, confidence, accepted, rejected_by, detail_json)
          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
       )
-      .run(runId, s.symbol, s.ts, s.direction, s.reason, s.confidence ?? null, accepted ? 1 : 0, rejectedBy ?? null, JSON.stringify(s.detail ?? {}));
+        .run(runId, s.symbol, s.ts, s.direction, s.reason, s.confidence ?? null, accepted ? 1 : 0, rejectedBy ?? null, JSON.stringify(s.detail ?? {})));
   }
 
   // --- replay reads ------------------------------------------------------

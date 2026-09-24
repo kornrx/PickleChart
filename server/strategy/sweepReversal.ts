@@ -1,5 +1,6 @@
 import { ExitSignal, Strategy, StrategyContext, StrategySignal } from './types';
 import { LiquidityPool, SweptOrderEvent } from '../../src/types/liquidity';
+import { MarketSymbol } from '../../src/types/market';
 
 export interface SweepReversalParams {
   /** Only consider sweeps this recent, in ms. */
@@ -10,10 +11,35 @@ export interface SweepReversalParams {
   minFlowFlip: number;
   /** Minimum book imbalance backing the entry direction, in [0, 1]. */
   minBookSupport: number;
-  /** Minimum swept notional (USDT) — small sweeps are noise. */
+  /**
+   * Minimum swept notional (USDT) — small sweeps are noise. What counts as
+   * small depends on the book: gold perp turns over roughly a sixth of BTC's
+   * volume, so one global figure either floods one symbol with noise or
+   * silences the other entirely.
+   */
   minSweptNotional: number;
+  /** Per-symbol overrides of the sweep floor, scaled to each book's depth. */
+  minSweptNotionalBySymbol: Partial<Record<MarketSymbol, number>>;
   /** Stop goes this many ticks beyond the sweep extreme. */
   stopBufferTicks: number;
+  /**
+   * Round-trip cost in basis points, in price terms. Everything below is sized
+   * against it: a target the fee can swallow is not a target.
+   */
+  roundTripFeeBps: number;
+  /**
+   * Floor on the stop distance, as a multiple of the round-trip cost. A stop
+   * tighter than the market's own noise over the holding period is not a stop,
+   * it is a coin flip that pays fees either way.
+   */
+  minStopFeeMultiple: number;
+  /**
+   * Floor on the target distance, as a multiple of the round-trip cost.
+   * Measured on 317k gold ticks: over 15 minutes the median move is 5.99 USD
+   * against a 4.29 USD round trip — 72% of the move paid away in costs. Over
+   * 90 minutes the same cost is closer to a quarter of the move.
+   */
+  minTargetFeeMultiple: number;
   /** Fallback reward multiple when no opposing pool is in range. */
   defaultRMultiple: number;
   /** Reject setups whose reward:risk falls below this. */
@@ -22,6 +48,12 @@ export interface SweepReversalParams {
   maxSpreadTicks: number;
   /** Move the stop to break-even once price is this many R in favour. */
   breakEvenAtR: number;
+  /**
+   * Push the break-even stop past entry by this multiple of the round trip.
+   * A stop sitting exactly at entry does not scratch the trade — being tagged
+   * there costs the full fee, every time.
+   */
+  breakEvenFeeMultiple: number;
   /** Abandon a trade that has gone nowhere after this long, in ms. */
   maxHoldMs: number;
 }
@@ -32,12 +64,24 @@ export const DEFAULT_SWEEP_PARAMS: SweepReversalParams = {
   minFlowFlip: 0.15,
   minBookSupport: 0.05,
   minSweptNotional: 25_000,
+  minSweptNotionalBySymbol: {
+    BTCUSDT: 25_000,
+    // Measured over 78 minutes of ticks: XAU 810k USDT/min against BTC 4,997k.
+    XAUUSDT: 4_000,
+  },
   stopBufferTicks: 3,
+  roundTripFeeBps: 10,
+  minStopFeeMultiple: 1.5,
+  minTargetFeeMultiple: 4,
   defaultRMultiple: 2,
   minRewardRisk: 1.5,
   maxSpreadTicks: 4,
   breakEvenAtR: 1,
-  maxHoldMs: 15 * 60_000,
+  breakEvenFeeMultiple: 1,
+  // The move a trade needs has to fit inside the time it is given. Fifteen
+  // minutes on gold offers a median of 5.99 USD to work with; ninety offers
+  // roughly double that, against the same fixed cost.
+  maxHoldMs: 90 * 60_000,
 };
 
 /**
@@ -67,13 +111,44 @@ export class SweepReversalStrategy implements Strategy {
   }
 
   evaluateEntry(ctx: StrategyContext): StrategySignal | null {
-    const p = this.params;
-    if (ctx.candles.length < this.warmupCandles) return null;
-    if (!ctx.book || !ctx.imbalance) return null;
-    if (ctx.imbalance.spread > p.maxSpreadTicks * ctx.tickSize) return null;
+    return this.explain(ctx).signal;
+  }
 
-    const sweep = this.mostRecentSweep(ctx);
-    if (!sweep) return null;
+  /**
+   * Entry logic with the blocking gate named.
+   *
+   * `evaluateEntry` is a thin wrapper over this, so tuning tools can count why
+   * setups are being turned down without a second copy of the rules to drift
+   * out of step.
+   */
+  explain(ctx: StrategyContext): { signal: StrategySignal | null; blockedBy?: string } {
+    const p = this.params;
+    if (ctx.candles.length < this.warmupCandles) return { signal: null, blockedBy: 'warmup' };
+    if (!ctx.book || !ctx.imbalance) return { signal: null, blockedBy: 'no book' };
+    if (ctx.imbalance.spread > p.maxSpreadTicks * ctx.tickSize) return { signal: null, blockedBy: 'spread too wide' };
+
+    // Consider every sweep still inside the lookback, newest first, rather than
+    // the newest alone. On a busy book a fresh sweep arrives every few seconds
+    // and has not had time to be reclaimed, so fixing on the latest one hides
+    // the slightly older sweep that has actually matured into a setup.
+    const candidates = this.qualifyingSweeps(ctx);
+    if (candidates.length === 0) return { signal: null, blockedBy: 'no qualifying sweep' };
+
+    let lastBlock = 'no reclaim';
+    for (const sweep of candidates) {
+      const attempt = this.evaluateSweep(ctx, sweep);
+      if (attempt.signal) return attempt;
+      lastBlock = attempt.blockedBy ?? lastBlock;
+    }
+    return { signal: null, blockedBy: lastBlock };
+  }
+
+  /** One sweep, checked against every entry gate. */
+  private evaluateSweep(
+    ctx: StrategyContext,
+    sweep: SweptOrderEvent
+  ): { signal: StrategySignal | null; blockedBy?: string } {
+    const p = this.params;
 
     // A sweep driven by sellers sets up a long, and vice versa.
     const direction: 'long' | 'short' = sweep.aggressorSide === 'sell' ? 'long' : 'short';
@@ -81,27 +156,40 @@ export class SweepReversalStrategy implements Strategy {
 
     // 1. Price must have reclaimed the swept level.
     const reclaim = (ctx.lastPrice - sweep.price) * dir;
-    if (reclaim < p.reclaimTicks * ctx.tickSize) return null;
+    if (reclaim < p.reclaimTicks * ctx.tickSize) return { signal: null, blockedBy: 'no reclaim' };
 
     // 2. Aggressor flow must have flipped against the sweep.
-    if (ctx.flow.deltaRatio * dir < p.minFlowFlip) return null;
+    if (ctx.flow.deltaRatio * dir < p.minFlowFlip) return { signal: null, blockedBy: 'flow not flipped' };
 
     // 3. The resting book should back the reversal rather than fight it.
-    if (ctx.imbalance.ratio * dir < p.minBookSupport) return null;
+    if (ctx.imbalance!.ratio * dir < p.minBookSupport) return { signal: null, blockedBy: 'book against' };
 
-    // Stop sits beyond the extreme the sweep actually reached.
+    // Everything from here is measured against what a round trip costs.
+    const feePrice = ctx.lastPrice * (p.roundTripFeeBps / 10_000);
+
+    // Stop sits beyond the extreme the sweep actually reached, but never inside
+    // the noise: a stop the market crosses by accident just pays fees.
     const extreme = this.sweepExtreme(ctx, sweep, direction);
-    const stopLoss = extreme - dir * p.stopBufferTicks * ctx.tickSize;
+    let stopLoss = extreme - dir * p.stopBufferTicks * ctx.tickSize;
+    const minStopDistance = p.minStopFeeMultiple * feePrice;
+    if (Math.abs(ctx.lastPrice - stopLoss) < minStopDistance) {
+      stopLoss = ctx.lastPrice - dir * minStopDistance;
+    }
     const risk = Math.abs(ctx.lastPrice - stopLoss);
-    if (risk <= 0) return null;
+    if (risk <= 0) return { signal: null, blockedBy: 'zero risk' };
 
-    // Target the nearest opposing pool if one is in range, else a flat R multiple.
-    const target = this.nearestOpposingPool(ctx, direction);
-    const takeProfit = target ?? ctx.lastPrice + dir * risk * p.defaultRMultiple;
+    // Target the nearest opposing pool that is far enough to be worth reaching.
+    // A pool inside the cost floor is a landmark on the way, not an exit, so
+    // look past it rather than pretending a fee-sized move is a trade.
+    const minTargetDistance = p.minTargetFeeMultiple * feePrice;
+    const pool = this.nearestOpposingPool(ctx, direction, minTargetDistance);
+    const takeProfit =
+      pool ?? ctx.lastPrice + dir * Math.max(risk * p.defaultRMultiple, minTargetDistance);
+
     const reward = (takeProfit - ctx.lastPrice) * dir;
-    if (reward / risk < p.minRewardRisk) return null;
+    if (reward / risk < p.minRewardRisk) return { signal: null, blockedBy: 'reward:risk too low' };
 
-    return {
+    return { signal: {
       symbol: ctx.symbol,
       ts: ctx.now,
       direction,
@@ -113,14 +201,18 @@ export class SweepReversalStrategy implements Strategy {
       detail: {
         sweepId: sweep.id,
         sweepPrice: sweep.price,
+        sweepAgeMs: ctx.now - sweep.time,
         sweptNotional: sweep.notional,
         reaction: sweep.reaction,
         deltaRatio: ctx.flow.deltaRatio,
-        bookImbalance: ctx.imbalance.ratio,
+        bookImbalance: ctx.imbalance!.ratio,
         rewardRisk: reward / risk,
-        targetFromPool: target != null,
+        stopDistance: risk,
+        targetDistance: reward,
+        feePrice,
+        targetFromPool: pool != null && takeProfit === pool,
       },
-    };
+    } };
   }
 
   evaluateExit(ctx: StrategyContext): ExitSignal | null {
@@ -137,25 +229,35 @@ export class SweepReversalStrategy implements Strategy {
       const dir = pos.direction === 'long' ? 1 : -1;
       const risk = Math.abs(pos.entryPrice - pos.stopLoss);
       const movedR = risk > 0 ? ((ctx.lastPrice - pos.entryPrice) * dir) / risk : 0;
-      const alreadyAtBreakEven = (pos.stopLoss - pos.entryPrice) * dir >= 0;
-      if (movedR >= p.breakEvenAtR && !alreadyAtBreakEven) {
-        return { reason: `+${p.breakEvenAtR}R — stop to break-even`, newStopLoss: pos.entryPrice };
+      // Break even means keeping the fees, not just the entry price.
+      const feePrice = ctx.lastPrice * (p.roundTripFeeBps / 10_000);
+      const breakEven = pos.entryPrice + dir * p.breakEvenFeeMultiple * feePrice;
+      const alreadyThere = (pos.stopLoss - breakEven) * dir >= 0;
+      if (movedR >= p.breakEvenAtR && !alreadyThere) {
+        return { reason: `+${p.breakEvenAtR}R — stop to break-even plus costs`, newStopLoss: breakEven };
       }
     }
 
     return null;
   }
 
-  private mostRecentSweep(ctx: StrategyContext): SweptOrderEvent | null {
+  /** The sweep floor for this symbol, falling back to the global figure. */
+  public sweepFloorFor(symbol: MarketSymbol): number {
+    return this.params.minSweptNotionalBySymbol[symbol] ?? this.params.minSweptNotional;
+  }
+
+  /** Sweeps inside the lookback that clear the noise floor, newest first. */
+  private qualifyingSweeps(ctx: StrategyContext): SweptOrderEvent[] {
     const cutoff = ctx.now - this.params.sweepLookbackMs;
-    let best: SweptOrderEvent | null = null;
-    for (const s of ctx.sweptEvents) {
-      if (s.time < cutoff) continue;
-      if (s.notional < this.params.minSweptNotional) continue;
-      if (s.reaction === 'breakout_continuation') continue; // the run kept going; no reversal
-      if (!best || s.time > best.time) best = s;
-    }
-    return best;
+    const floor = this.sweepFloorFor(ctx.symbol);
+    return ctx.sweptEvents
+      .filter(
+        (s) =>
+          s.time >= cutoff &&
+          s.notional >= floor &&
+          s.reaction !== 'breakout_continuation' // the run kept going; no reversal
+      )
+      .sort((a, b) => b.time - a.time);
   }
 
   /** The furthest price reached against the intended direction since the sweep. */
@@ -170,16 +272,24 @@ export class SweepReversalStrategy implements Strategy {
     return extreme;
   }
 
-  /** Nearest un-swept pool in the direction of travel — where the move is likely to be sold into. */
-  private nearestOpposingPool(ctx: StrategyContext, direction: 'long' | 'short'): number | null {
+  /**
+   * Nearest un-swept pool in the direction of travel — where the move is likely
+   * to be sold into — ignoring any that sit closer than `minDistance`.
+   */
+  private nearestOpposingPool(
+    ctx: StrategyContext,
+    direction: 'long' | 'short',
+    minDistance = 0
+  ): number | null {
     const dir = direction === 'long' ? 1 : -1;
     const wanted = direction === 'long' ? 'BSL' : 'SSL';
     let best: LiquidityPool | null = null;
     for (const pool of ctx.liquidityPools) {
       if (pool.isSwept) continue;
       if (pool.type !== wanted) continue;
-      if ((pool.price - ctx.lastPrice) * dir <= 0) continue;
-      if (!best || (pool.price - ctx.lastPrice) * dir < (best.price - ctx.lastPrice) * dir) best = pool;
+      const distance = (pool.price - ctx.lastPrice) * dir;
+      if (distance < minDistance) continue;
+      if (!best || distance < (best.price - ctx.lastPrice) * dir) best = pool;
     }
     return best ? best.price : null;
   }

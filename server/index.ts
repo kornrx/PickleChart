@@ -6,12 +6,13 @@ import { TradeDatabase } from './db';
 import { MarketContext } from './marketContext';
 import { TradingEngine } from './tradingEngine';
 import { SweepReversalStrategy } from './strategy/sweepReversal';
+import { TVBridge } from './tvBridge';
 
 const config = loadConfig();
 const runId = `run-${new Date().toISOString().replace(/[:.]/g, '-')}`;
 const strategy = new SweepReversalStrategy();
 
-const db = new TradeDatabase(config.db.path);
+const db = new TradeDatabase(config.db.path, (msg) => log(msg));
 db.startRun(runId, 'live-paper', { config, strategy: strategy.describe?.() ?? {} });
 
 const engine = new TradingEngine({
@@ -31,6 +32,13 @@ const engine = new TradingEngine({
 });
 
 const services = new Map<MarketSymbol, BinanceService>();
+// Opt-in: drawing on someone's live chart should never be a surprise.
+const tvEnabled = process.env.PC_TV_BRIDGE === '1';
+// Binance lists these as perpetuals; TradingView marks perps with a `.P`
+// suffix, and the plain spot ticker has no data to hang a drawing on.
+const tvSymbol = process.env.PC_TV_SYMBOL ?? `BINANCE:${config.symbols[0]}.P`;
+let tvBridge: TVBridge | null = null;
+let tvLastSkip = '';
 const lastBookWrite = new Map<string, number>();
 let shuttingDown = false;
 
@@ -145,6 +153,18 @@ function broadcast() {
 // --- loops ---------------------------------------------------------------
 
 const evalTimer = setInterval(() => engine.evaluate(Date.now()), config.evalIntervalMs);
+// A long collection run is checked by reading the log, so say something useful
+// on a slow cadence even when nothing trades.
+const heartbeatTimer = setInterval(() => {
+  const stats = engine.computeStats();
+  const counts = config.symbols.map((s) => `${s} ${db.countTrades(s).toLocaleString()}`).join(', ');
+  const errors = db.getWriteErrorCount();
+  log(
+    `heartbeat — ticks: ${counts} | signals ${stats.signalsSeen} seen / ${stats.signalsTaken} taken | ` +
+      `trades ${stats.tradesClosed} | equity ${engine.getBroker().equity.toFixed(2)}` +
+      (errors > 0 ? ` | journal errors ${errors}` : '')
+  );
+}, 15 * 60_000);
 const pushTimer = setInterval(broadcast, 500);
 const flushTimer = setInterval(() => db.flushTrades(), 5_000);
 
@@ -155,6 +175,47 @@ async function main() {
   log(`telemetry: ws://localhost:${config.ws.port}`);
 
   for (const symbol of config.symbols) await startSymbol(symbol);
+
+  if (tvEnabled) {
+    tvBridge = new TVBridge({ requireSymbol: tvSymbol, onLog: log });
+    const ok = await tvBridge.connect();
+    if (!ok) {
+      tvBridge = null;
+      log('TradingView bridge unavailable — continuing without it');
+    } else {
+      log(`TradingView bridge live, drawing on ${tvSymbol}`);
+      setInterval(syncTradingView, 3_000);
+    }
+  }
+}
+
+/** Push the current order-flow levels onto the TradingView chart. */
+async function syncTradingView() {
+  if (!tvBridge) return;
+  const symbol = config.symbols[0];
+  const ctx = engine.getContext(symbol);
+  if (!ctx) return;
+
+  const view = ctx.buildContext(Date.now(), engine.getBroker().getPosition(symbol));
+  try {
+    const result = await tvBridge.sync({
+      symbol,
+      lastPrice: view.lastPrice,
+      pools: view.liquidityPools,
+      walls: view.limitWalls,
+      sweeps: view.sweptEvents,
+      position: engine.getBroker().getPosition(symbol),
+    });
+    // Only report a skip the first time, or it repeats every three seconds.
+    if (result.skipped && result.skipped !== tvLastSkip) {
+      log(`TradingView bridge idle: ${result.skipped}`);
+      tvLastSkip = result.skipped;
+    } else if (!result.skipped) {
+      tvLastSkip = '';
+    }
+  } catch (err) {
+    log(`TradingView sync failed: ${String(err)}`);
+  }
 }
 
 function shutdown() {
@@ -163,6 +224,7 @@ function shutdown() {
   log('shutting down — flattening paper positions and flushing journal');
 
   clearInterval(evalTimer);
+  clearInterval(heartbeatTimer);
   clearInterval(pushTimer);
   clearInterval(flushTimer);
 
@@ -174,12 +236,21 @@ function shutdown() {
       `net ${engine.getBroker().realized.toFixed(2)} USDT`
   );
 
+  void tvBridge?.clear();
+  tvBridge?.close();
   for (const s of services.values()) s.disconnect();
   db.endRun(runId);
   db.close();
   wss.close();
   process.exit(0);
 }
+
+process.on('uncaughtException', (err) => {
+  log(`uncaught error, continuing: ${String(err)}`);
+});
+process.on('unhandledRejection', (reason) => {
+  log(`unhandled rejection, continuing: ${String(reason)}`);
+});
 
 process.on('SIGINT', shutdown);
 process.on('SIGTERM', shutdown);
