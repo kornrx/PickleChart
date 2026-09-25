@@ -29,6 +29,7 @@ export class TradeDatabase {
     this.db.exec('PRAGMA busy_timeout = 15000');
     this.migrate();
     this.rekeyRunScopedTables();
+    this.addMissingColumns();
   }
 
   private migrate() {
@@ -100,6 +101,7 @@ export class TradeDatabase {
         take_profit REAL,
         gross_pnl REAL NOT NULL,
         fees REAL NOT NULL,
+        funding REAL NOT NULL DEFAULT 0,
         net_pnl REAL NOT NULL,
         r_multiple REAL,
         exit_reason TEXT NOT NULL,
@@ -117,6 +119,13 @@ export class TradeDatabase {
       );
       CREATE INDEX IF NOT EXISTS idx_equity_run ON equity_curve(run_id, ts);
 
+      CREATE TABLE IF NOT EXISTS funding_rates (
+        symbol TEXT NOT NULL,
+        settlement_ts INTEGER NOT NULL,
+        rate REAL NOT NULL,
+        PRIMARY KEY (symbol, settlement_ts)
+      );
+
       CREATE TABLE IF NOT EXISTS signals (
         run_id TEXT NOT NULL,
         symbol TEXT NOT NULL,
@@ -130,6 +139,25 @@ export class TradeDatabase {
       );
       CREATE INDEX IF NOT EXISTS idx_signals_run ON signals(run_id, ts);
     `);
+  }
+
+  /**
+   * `CREATE TABLE IF NOT EXISTS` is a no-op on a database that already has the
+   * table, so a new column never reaches an existing file. Without this, writes
+   * naming that column fail — and because journal writes are best-effort, they
+   * would fail quietly.
+   */
+  private addMissingColumns() {
+    const columns: Array<[string, string, string]> = [
+      ['closed_trades', 'funding', 'REAL NOT NULL DEFAULT 0'],
+    ];
+    for (const [table, column, definition] of columns) {
+      const existing = this.db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>;
+      if (existing.length === 0) continue;
+      if (existing.some((c) => c.name === column)) continue;
+      this.db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`);
+      this.onError?.(`schema: added ${table}.${column}`);
+    }
   }
 
   /**
@@ -176,10 +204,15 @@ export class TradeDatabase {
       fn();
     } catch (err) {
       this.writeErrors++;
+      const message = String(err);
+      // A missing table or column is a bug, not a busy database — say so at once.
+      const isSchemaError = /no such (table|column)|has no column/i.test(message);
       const now = Date.now();
-      if (now - this.lastErrorLog > 30_000) {
+      if (isSchemaError || now - this.lastErrorLog > 30_000) {
         this.lastErrorLog = now;
-        this.onError?.(`journal write failed (${what}): ${String(err)} — ${this.writeErrors} total, collection continues`);
+        this.onError?.(
+          `journal write failed (${what}): ${message} — ${this.writeErrors} total, collection continues`
+        );
       }
     }
   }
@@ -284,12 +317,12 @@ export class TradeDatabase {
         .prepare(
         `INSERT INTO closed_trades
          (id, run_id, symbol, direction, qty, entry_ts, exit_ts, entry_price, exit_price,
-          stop_loss, take_profit, gross_pnl, fees, net_pnl, r_multiple, exit_reason, entry_reason)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+          stop_loss, take_profit, gross_pnl, fees, funding, net_pnl, r_multiple, exit_reason, entry_reason)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
       )
         .run(
         t.id, runId, t.symbol, t.direction, t.qty, t.entryTs, t.exitTs, t.entryPrice, t.exitPrice,
-        t.stopLoss ?? null, t.takeProfit ?? null, t.grossPnl, t.fees, t.netPnl, t.rMultiple ?? null,
+        t.stopLoss ?? null, t.takeProfit ?? null, t.grossPnl, t.fees, t.funding, t.netPnl, t.rMultiple ?? null,
         t.exitReason, t.entryReason ?? null
       ));
   }
@@ -309,6 +342,31 @@ export class TradeDatabase {
          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
       )
         .run(runId, s.symbol, s.ts, s.direction, s.reason, s.confidence ?? null, accepted ? 1 : 0, rejectedBy ?? null, JSON.stringify(s.detail ?? {})));
+  }
+
+  upsertFundingRates(symbol: string, rates: Array<{ ts: number; rate: number }>) {
+    if (rates.length === 0) return;
+    this.safeWrite('funding_rates', () => {
+      const stmt = this.db.prepare(
+        'INSERT INTO funding_rates (symbol, settlement_ts, rate) VALUES (?, ?, ?) ON CONFLICT(symbol, settlement_ts) DO UPDATE SET rate = excluded.rate'
+      );
+      this.db.exec('BEGIN');
+      try {
+        for (const r of rates) stmt.run(symbol, r.ts, r.rate);
+        this.db.exec('COMMIT');
+      } catch (err) {
+        this.db.exec('ROLLBACK');
+        throw err;
+      }
+    });
+  }
+
+  /** Measured funding settlements for a symbol, oldest first. */
+  readFundingRates(symbol: string): Array<{ ts: number; rate: number }> {
+    const rows = this.db
+      .prepare('SELECT settlement_ts, rate FROM funding_rates WHERE symbol = ? ORDER BY settlement_ts')
+      .all(symbol) as Array<{ settlement_ts: number; rate: number }>;
+    return rows.map((r) => ({ ts: r.settlement_ts, rate: r.rate }));
   }
 
   // --- replay reads ------------------------------------------------------
@@ -377,6 +435,7 @@ export class TradeDatabase {
       takeProfit: (r.take_profit as number | null) ?? undefined,
       grossPnl: r.gross_pnl as number,
       fees: r.fees as number,
+      funding: (r.funding as number | null) ?? 0,
       netPnl: r.net_pnl as number,
       rMultiple: (r.r_multiple as number | null) ?? undefined,
       exitReason: r.exit_reason as ClosedTrade['exitReason'],

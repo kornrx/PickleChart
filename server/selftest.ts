@@ -42,6 +42,27 @@ function newBroker() {
   return new PaperBroker({ startingEquity: 10_000, takerFeeBps: 5, makerFeeBps: 2 });
 }
 
+const HOUR = 3_600_000;
+
+/** Broker that fills a limit only once price trades a full tick through it. */
+function strictBroker(tick = 0.5) {
+  return new PaperBroker({
+    startingEquity: 10_000, takerFeeBps: 5, makerFeeBps: 2,
+    tickSize: { XAUUSDT: tick }, fillThroughTicks: 1,
+  });
+}
+
+function fundedBroker(settlements: Array<{ ts: number; rate: number }>) {
+  return new PaperBroker({
+    startingEquity: 10_000, takerFeeBps: 5, makerFeeBps: 2,
+    funding: {
+      fallbackIntervalMs: 8 * HOUR,
+      fallbackRate: 0.0001,
+      settlementsBetween: (_s, after, upTo) => settlements.filter((x) => x.ts > after && x.ts <= upTo),
+    },
+  });
+}
+
 console.log('\npaper broker');
 
 test('market order walks the book for a size-weighted fill', () => {
@@ -178,6 +199,96 @@ test('equity tracks realized and unrealized pnl', () => {
   assert.ok(b.realized > 9, 'realized pnl should carry the gain');
 });
 
+test('a limit that is only touched does not fill', () => {
+  const b = strictBroker();
+  b.updateBook('XAUUSDT', book([[99, 100]], [[100, 100]]));
+  b.openLimit({ symbol: 'XAUUSDT', direction: 'long', qty: 1, price: 98, ts: 1_000 });
+
+  // Price reaches the level and bounces. The queue ahead of us absorbed it.
+  b.onTrade('XAUUSDT', tick(98, 'sell', 1_100));
+  assert.equal(b.getOpenPositionCount(), 0);
+
+  // Price trades a full tick through. Now the queue is cleared and we fill.
+  b.onTrade('XAUUSDT', tick(97.5, 'sell', 1_200));
+  assert.equal(b.getOpenPositionCount(), 1);
+});
+
+test('a short limit needs price through it on the way up', () => {
+  const b = strictBroker();
+  b.updateBook('XAUUSDT', book([[99, 100]], [[100, 100]]));
+  b.openLimit({ symbol: 'XAUUSDT', direction: 'short', qty: 1, price: 102, ts: 1_000 });
+  b.onTrade('XAUUSDT', tick(102, 'buy', 1_100));
+  assert.equal(b.getOpenPositionCount(), 0);
+  b.onTrade('XAUUSDT', tick(102.5, 'buy', 1_200));
+  assert.equal(b.getOpenPositionCount(), 1);
+});
+
+console.log('\nfunding');
+
+test('a long pays funding at each settlement it is held through', () => {
+  const settlements = [
+    { ts: 4 * HOUR, rate: 0.0001 },
+    { ts: 8 * HOUR, rate: 0.0002 },
+  ];
+  const b = fundedBroker(settlements);
+  b.updateBook('XAUUSDT', book([[99, 1000]], [[100, 1000]]));
+  b.onTrade('XAUUSDT', tick(100, 'buy', 1 * HOUR)); // establishes the clock
+  b.openMarket({ symbol: 'XAUUSDT', direction: 'long', qty: 2, ts: 1 * HOUR });
+
+  b.onTrade('XAUUSDT', tick(100, 'buy', 5 * HOUR)); // crosses the 4h settlement
+  near(b.funding, 200 * 0.0001);
+
+  b.onTrade('XAUUSDT', tick(100, 'buy', 9 * HOUR)); // crosses the 8h settlement
+  near(b.funding, 200 * 0.0001 + 200 * 0.0002);
+});
+
+test('a short receives funding when the rate is positive', () => {
+  const b = fundedBroker([{ ts: 4 * HOUR, rate: 0.0001 }]);
+  b.updateBook('XAUUSDT', book([[100, 1000]], [[101, 1000]]));
+  b.onTrade('XAUUSDT', tick(100, 'sell', 1 * HOUR));
+  b.openMarket({ symbol: 'XAUUSDT', direction: 'short', qty: 2, ts: 1 * HOUR });
+  b.onTrade('XAUUSDT', tick(100, 'sell', 5 * HOUR));
+  near(b.funding, -200 * 0.0001);
+});
+
+test('funding charged is carried into the closed trade and the equity', () => {
+  const b = fundedBroker([{ ts: 4 * HOUR, rate: 0.001 }]);
+  b.updateBook('XAUUSDT', book([[99, 1000]], [[100, 1000]]));
+  b.onTrade('XAUUSDT', tick(100, 'buy', 1 * HOUR));
+  b.openMarket({ symbol: 'XAUUSDT', direction: 'long', qty: 2, ts: 1 * HOUR });
+  b.onTrade('XAUUSDT', tick(100, 'buy', 5 * HOUR));
+
+  const equityBefore = b.equity;
+  b.close('XAUUSDT', 5 * HOUR, 'strategy_exit');
+  const t = b.getClosedTrades()[0];
+  near(t.funding, 200 * 0.001);
+  // Net carries fees and funding, not just the price move.
+  near(t.netPnl, t.grossPnl - t.fees - t.funding);
+  assert.ok(equityBefore < 10_000, 'funding should already have reduced equity before the close');
+});
+
+test('a position opened and closed inside one settlement pays no funding', () => {
+  const b = fundedBroker([{ ts: 8 * HOUR, rate: 0.001 }]);
+  b.updateBook('XAUUSDT', book([[99, 1000]], [[100, 1000]]));
+  b.onTrade('XAUUSDT', tick(100, 'buy', 1 * HOUR));
+  b.openMarket({ symbol: 'XAUUSDT', direction: 'long', qty: 2, ts: 1 * HOUR });
+  b.onTrade('XAUUSDT', tick(100, 'buy', 2 * HOUR));
+  b.close('XAUUSDT', 2 * HOUR, 'strategy_exit');
+  near(b.getClosedTrades()[0].funding, 0);
+});
+
+test('a symbol with no measured schedule falls back to the configured interval', () => {
+  const b = new PaperBroker({
+    startingEquity: 10_000, takerFeeBps: 5, makerFeeBps: 2,
+    funding: { fallbackIntervalMs: 8 * HOUR, fallbackRate: 0.0001 },
+  });
+  b.updateBook('XAUUSDT', book([[99, 1000]], [[100, 1000]]));
+  b.onTrade('XAUUSDT', tick(100, 'buy', 1 * HOUR));
+  b.openMarket({ symbol: 'XAUUSDT', direction: 'long', qty: 2, ts: 1 * HOUR });
+  b.onTrade('XAUUSDT', tick(100, 'buy', 9 * HOUR)); // one 8h boundary crossed
+  near(b.funding, 200 * 0.0001);
+});
+
 console.log('\nrisk manager');
 
 const signal = (stopLoss: number): StrategySignal => ({
@@ -282,7 +393,7 @@ test('a losing trade starts a cooldown on that symbol', () => {
   r.onTradeClosed({
     id: 't1', symbol: 'XAUUSDT', direction: 'long', qty: 1,
     entryTs: 500, exitTs: 1_000, entryPrice: 3_300, exitPrice: 3_290,
-    grossPnl: -10, fees: 1, netPnl: -11, exitReason: 'stop_loss',
+    grossPnl: -10, fees: 1, funding: 0, netPnl: -11, exitReason: 'stop_loss',
   });
   const blocked = r.evaluate(signal(3_295), { equity: 10_000, openPositions: 0, price: 3_300, now: 30_000 });
   assert.equal(blocked.approved, false);
@@ -477,7 +588,7 @@ test('moves the stop to break-even once the trade is 1R onside', () => {
     lastPrice: 3_310,
     position: {
       symbol: 'XAUUSDT', direction: 'long', qty: 1, entryPrice: 3_302, entryTs: 990_000,
-      stopLoss: 3_297, takeProfit: 3_312, entryFee: 0, unrealizedPnl: 8,
+      stopLoss: 3_297, takeProfit: 3_312, entryFee: 0, fundingPaid: 0, unrealizedPnl: 8,
       markPrice: 3_310, maxFavorable: 8, maxAdverse: 0,
     },
   });
@@ -494,7 +605,7 @@ test('abandons a trade that has run past the max hold time', () => {
     now: 990_000 + 100 * 60_000,
     position: {
       symbol: 'XAUUSDT', direction: 'long', qty: 1, entryPrice: 3_302, entryTs: 990_000,
-      stopLoss: 3_297, takeProfit: 3_312, entryFee: 0, unrealizedPnl: 0,
+      stopLoss: 3_297, takeProfit: 3_312, entryFee: 0, fundingPaid: 0, unrealizedPnl: 0,
       markPrice: 3_302, maxFavorable: 0, maxAdverse: 0,
     },
   });

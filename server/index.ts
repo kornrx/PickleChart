@@ -21,6 +21,7 @@ const engine = new TradingEngine({
   config,
   strategy,
   db,
+  fundingRates: new Map(config.symbols.map((sym) => [sym as string, db.readFundingRates(sym)])),
   events: {
     onOrder: (o) =>
       log(`${o.status.toUpperCase()} ${o.side} ${o.qty} ${o.symbol} @ ${o.fillPrice?.toFixed(2) ?? o.price?.toFixed(2) ?? '-'} ${o.reason ? `(${o.reason})` : ''}`),

@@ -11,7 +11,9 @@
     "backtest": "tsx server/backtest.ts",
     "typecheck": "tsc --noEmit && tsc -p tsconfig.server.json",
     "selftest": "tsx server/selftest.ts",
-    "diagnose": "tsx server/diagnose.ts"
+    "diagnose": "tsx server/diagnose.ts",
+    "fetch-funding": "tsx server/fetchFunding.ts",
+    "grid-scan": "tsx server/gridScan.ts"
   },
   "dependencies": {
     "clsx": "^2.1.1",

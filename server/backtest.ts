@@ -49,9 +49,11 @@ async function main() {
   const runId = `bt-${new Date().toISOString().replace(/[:.]/g, '-')}`;
   const strategy = new SweepReversalStrategy();
 
-  // Collect every stored tick and snapshot in the window, then replay in time order.
-  const events: ReplayEvent[] = [];
-  const perSymbol: Array<{ symbol: MarketSymbol; trades: number }> = [];
+  // Work out the window per symbol first, but do not materialise the ticks:
+  // a day of two symbols is millions of rows and loading them all at once ran
+  // the heap out. Replay proceeds in time slices instead, so memory stays flat
+  // however long the collector has been running.
+  const perSymbol: Array<{ symbol: MarketSymbol; from: number; to: number; trades: number }> = [];
 
   for (const symbol of config.symbols) {
     const range = db.tradeRange(symbol);
@@ -61,25 +63,26 @@ async function main() {
     }
     const from = toMs(args.from, range.from);
     const to = toMs(args.to, range.to);
-
-    const trades = db.readTrades(symbol, from, to);
-    const books = db.readBookSnapshots(symbol, from, to);
-    for (const t of trades) events.push({ kind: 'trade', symbol, ts: t.time, trade: t });
-    for (const b of books) events.push({ kind: 'book', symbol, ts: b.timestamp, book: b });
-    perSymbol.push({ symbol, trades: trades.length });
+    perSymbol.push({ symbol, from, to, trades: db.countTrades(symbol) });
   }
 
-  if (events.length === 0) {
+  if (perSymbol.length === 0) {
     console.log('nothing to replay.');
     db.close();
     return;
   }
 
-  // Books before trades at equal timestamps: the strategy should see the book
-  // state that existed when the print happened, not after it.
-  events.sort((a, b) => a.ts - b.ts || (a.kind === 'book' ? -1 : 1));
+  const windowFrom = Math.min(...perSymbol.map((s) => s.from));
+  const windowTo = Math.max(...perSymbol.map((s) => s.to));
 
-  const engine = new TradingEngine({ runId, mode: 'backtest', config, strategy, db });
+  // Charge what was actually paid, where it has been collected.
+  const fundingRates = new Map(config.symbols.map((sym) => [sym as string, db.readFundingRates(sym)]));
+  const missing = [...fundingRates].filter(([, r]) => r.length === 0).map(([sym]) => sym);
+  if (missing.length > 0) {
+    console.log(`no funding rates stored for ${missing.join(', ')} — falling back to the configured rate. Run: npm run fetch-funding`);
+  }
+
+  const engine = new TradingEngine({ runId, mode: 'backtest', config, strategy, db, fundingRates });
   for (const { symbol } of perSymbol) {
     engine.registerContext(new MarketContext({ symbol, timeframe: '1s' }));
   }
@@ -87,32 +90,59 @@ async function main() {
   db.startRun(runId, 'backtest', {
     config,
     strategy: strategy.describe?.() ?? {},
-    window: { from: events[0].ts, to: events[events.length - 1].ts },
+    window: { from: windowFrom, to: windowTo },
   });
 
   const startedAt = Date.now();
-  const equitySamples: Array<{ ts: number; equity: number }> = [];
-  let nextEval = events[0].ts;
+  let nextEval = windowFrom;
   let peak = config.startingEquity;
   let maxDd = 0;
+  let replayed = 0;
+  let lastTs = windowFrom;
 
-  for (const ev of events) {
-    if (ev.kind === 'book') engine.onBook(ev.symbol, ev.book);
-    else engine.onTrade(ev.symbol, ev.trade);
+  const SLICE_MS = 30 * 60_000;
+  for (let sliceFrom = windowFrom; sliceFrom <= windowTo; sliceFrom += SLICE_MS) {
+    const sliceTo = Math.min(sliceFrom + SLICE_MS - 1, windowTo);
+    const events: ReplayEvent[] = [];
 
-    // Strategy clock advances with the tape, not with wall time.
-    if (ev.ts >= nextEval) {
-      engine.evaluate(ev.ts);
-      nextEval = ev.ts + config.evalIntervalMs;
-
-      const equity = engine.getBroker().equity;
-      equitySamples.push({ ts: ev.ts, equity });
-      peak = Math.max(peak, equity);
-      maxDd = Math.max(maxDd, peak > 0 ? (peak - equity) / peak : 0);
+    for (const { symbol, from, to } of perSymbol) {
+      if (sliceTo < from || sliceFrom > to) continue;
+      const lo = Math.max(sliceFrom, from);
+      const hi = Math.min(sliceTo, to);
+      for (const t of db.readTrades(symbol, lo, hi)) events.push({ kind: 'trade', symbol, ts: t.time, trade: t });
+      for (const b of db.readBookSnapshots(symbol, lo, hi)) events.push({ kind: 'book', symbol, ts: b.timestamp, book: b });
     }
+    if (events.length === 0) continue;
+
+    // Books before trades at equal timestamps: the strategy should see the book
+    // state that existed when the print happened, not after it.
+    events.sort((a, b) => a.ts - b.ts || (a.kind === 'book' ? -1 : 1));
+
+    for (const ev of events) {
+      if (ev.kind === 'book') engine.onBook(ev.symbol, ev.book);
+      else engine.onTrade(ev.symbol, ev.trade);
+      lastTs = ev.ts;
+
+      // Strategy clock advances with the tape, not with wall time.
+      if (ev.ts >= nextEval) {
+        engine.evaluate(ev.ts);
+        nextEval = ev.ts + config.evalIntervalMs;
+
+        const equity = engine.getBroker().equity;
+        peak = Math.max(peak, equity);
+        maxDd = Math.max(maxDd, peak > 0 ? (peak - equity) / peak : 0);
+      }
+    }
+    replayed += events.length;
   }
 
-  const lastTs = events[events.length - 1].ts;
+  if (replayed === 0) {
+    console.log('nothing to replay.');
+    db.endRun(runId);
+    db.close();
+    return;
+  }
+
   engine.getBroker().closeAll(lastTs, 'session_end');
   db.endRun(runId);
 
@@ -121,7 +151,7 @@ async function main() {
   const broker = engine.getBroker();
   const stats = engine.computeStats();
   const trades = broker.getClosedTrades();
-  const windowMs = lastTs - events[0].ts;
+  const windowMs = lastTs - windowFrom;
   const net = broker.realized;
 
   const wins = trades.filter((t) => t.netPnl > 0);
@@ -142,7 +172,7 @@ async function main() {
   console.log(line);
   console.log(`strategy        ${strategy.name}`);
   console.log(`symbols         ${perSymbol.map((s) => `${s.symbol} (${s.trades.toLocaleString()} ticks)`).join(', ')}`);
-  console.log(`window          ${new Date(events[0].ts).toISOString()} → ${new Date(lastTs).toISOString()}`);
+  console.log(`window          ${new Date(windowFrom).toISOString()} → ${new Date(lastTs).toISOString()}`);
   console.log(`duration        ${(windowMs / 3_600_000).toFixed(2)} h of market data`);
   console.log(`replay time     ${((Date.now() - startedAt) / 1000).toFixed(1)} s`);
   console.log(line);

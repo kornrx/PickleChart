@@ -1,4 +1,4 @@
-import { MarketSymbol, OrderBookState, RawTrade } from '../src/types/market';
+import { ASSET_MAP, MarketSymbol, OrderBookState, RawTrade } from '../src/types/market';
 import { ClosedTrade, EngineSnapshot, EngineStats, OrderRecord, StrategySignal } from '../src/types/trading';
 
 export type { EngineSnapshot, EngineStats };
@@ -49,6 +49,8 @@ export class TradingEngine {
     strategy: Strategy;
     db?: TradeDatabase | null;
     events?: EngineEvents;
+    /** Measured funding settlements by symbol, sorted by timestamp. */
+    fundingRates?: Map<string, Array<{ ts: number; rate: number }>>;
   }) {
     this.runId = params.runId;
     this.mode = params.mode;
@@ -57,10 +59,21 @@ export class TradingEngine {
     this.db = params.db ?? null;
     this.events = params.events ?? {};
 
+    const tickSize: Record<string, number> = {};
+    for (const symbol of this.cfg.symbols) tickSize[symbol] = ASSET_MAP[symbol]?.tickSize ?? 0.01;
+
     this.broker = new PaperBroker({
       startingEquity: this.cfg.startingEquity,
       takerFeeBps: this.cfg.takerFeeBps,
       makerFeeBps: this.cfg.makerFeeBps,
+      tickSize,
+      fillThroughTicks: this.cfg.fillThroughTicks,
+      funding: {
+        fallbackIntervalMs: this.cfg.funding.fallbackIntervalMs,
+        fallbackRate: this.cfg.funding.fallbackRate,
+        settlementsBetween: (symbol, after, upTo) =>
+          (params.fundingRates?.get(symbol) ?? []).filter((s) => s.ts > after && s.ts <= upTo),
+      },
       events: {
         onOrder: (o) => this.handleOrder(o),
         onClose: (t) => this.handleClose(t),
@@ -224,6 +237,7 @@ export class TradingEngine {
       realized: this.broker.realized,
       unrealized: this.broker.unrealized,
       fees: this.broker.fees,
+      funding: this.broker.funding,
       positions: this.broker.getPositions(),
       risk: this.risk.getState(),
       strategy: this.strategy.name,

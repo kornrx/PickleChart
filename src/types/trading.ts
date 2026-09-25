@@ -39,6 +39,8 @@ export interface Position {
   takeProfit?: number;
   entryReason?: string;
   entryFee: number;
+  /** Funding paid (positive) or received (negative) while this position has been open. */
+  fundingPaid: number;
   unrealizedPnl: number;
   markPrice: number;
   maxFavorable: number;
@@ -58,6 +60,8 @@ export interface ClosedTrade {
   takeProfit?: number;
   grossPnl: number;
   fees: number;
+  /** Funding settled over the life of the trade; a cost when positive. */
+  funding: number;
   netPnl: number;
   rMultiple?: number;
   exitReason: ExitReason;
@@ -108,6 +112,7 @@ export interface EngineSnapshot {
   realized: number;
   unrealized: number;
   fees: number;
+  funding: number;
   positions: Position[];
   risk: RiskState;
   strategy: string;

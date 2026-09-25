@@ -13,6 +13,18 @@ export interface TradingConfig {
   evalIntervalMs: number;
   /** Order-book snapshots are heavy; store at most one per symbol per interval. */
   bookSnapshotIntervalMs: number;
+  /** How many ticks past a resting limit an aggressor must trade before it fills. */
+  fillThroughTicks: number;
+  funding: {
+    /**
+     * Schedule used only when no measured settlements exist for a symbol.
+     * Real schedules differ per symbol — BTCUSDT every 8h, XAUUSDT every 4 —
+     * so run `npm run fetch-funding` and let the measured table take over.
+     */
+    fallbackIntervalMs: number;
+    /** Fallback rate per settlement, as a fraction of notional. */
+    fallbackRate: number;
+  };
   risk: RiskConfig;
   db: { path: string };
   ws: { port: number };
@@ -55,6 +67,8 @@ export const DEFAULT_CONFIG: TradingConfig = {
   makerFeeBps: 2,
   evalIntervalMs: 250,
   bookSnapshotIntervalMs: 1_000,
+  fillThroughTicks: 1,
+  funding: { fallbackIntervalMs: 8 * 3_600_000, fallbackRate: 0.0001 },
   risk: {
     riskPerTrade: 0.005,
     maxLeverage: 5,
@@ -88,6 +102,8 @@ export function loadConfig(): TradingConfig {
   c.risk.maxDailyLoss = num(process.env.PC_MAX_DAILY_LOSS, c.risk.maxDailyLoss);
   c.risk.maxDrawdown = num(process.env.PC_MAX_DRAWDOWN, c.risk.maxDrawdown);
   c.risk.minRewardToFee = num(process.env.PC_MIN_REWARD_TO_FEE, c.risk.minRewardToFee);
+  c.fillThroughTicks = num(process.env.PC_FILL_THROUGH_TICKS, c.fillThroughTicks);
+  c.funding.fallbackRate = num(process.env.PC_FUNDING_RATE, c.funding.fallbackRate);
   c.db.path = process.env.PC_DB ?? c.db.path;
   c.ws.port = num(process.env.PC_WS_PORT, c.ws.port);
 

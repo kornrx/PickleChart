@@ -179,6 +179,11 @@ export const TradingPanel: React.FC = () => {
           <Stat label="Realized" value={money(s.realized)} className={pnlClass(s.realized)} />
           <Stat label="Unrealized" value={money(s.unrealized)} className={pnlClass(s.unrealized)} />
           <Stat label="Fees paid" value={money(s.fees)} className="text-slate-600" />
+          <Stat
+            label="Funding"
+            value={money(s.funding)}
+            className={s.funding > 0 ? 'text-rose-700' : s.funding < 0 ? 'text-emerald-700' : 'text-slate-600'}
+          />
           <Stat label="Today" value={money(s.risk.dailyPnl)} className={pnlClass(s.risk.dailyPnl)} />
           <Stat
             label="Drawdown"

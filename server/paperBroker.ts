@@ -11,10 +11,37 @@ export interface BrokerEvents {
   onClose?: (t: ClosedTrade) => void;
 }
 
+export interface FundingOptions {
+  /**
+   * Measured settlements in (after, upTo], oldest first.
+   *
+   * The schedule is read rather than assumed: Binance settles BTCUSDT every
+   * eight hours but XAUUSDT every four, so a single interval would have
+   * undercharged gold by half.
+   */
+  settlementsBetween?: (symbol: string, after: number, upTo: number) => Array<{ ts: number; rate: number }>;
+  /** Fallback schedule when nothing has been collected for that symbol. */
+  fallbackIntervalMs: number;
+  /** Fallback rate per settlement, as a fraction of notional. */
+  fallbackRate: number;
+}
+
 export interface PaperBrokerOptions {
   startingEquity: number;
   takerFeeBps: number;
   makerFeeBps: number;
+  /** Price increment per symbol, used by the fill model. */
+  tickSize?: Record<string, number>;
+  /**
+   * How far past a resting limit an aggressor must trade before it fills.
+   *
+   * Queue position is not modelled, and at the round numbers a grid likes there
+   * are usually hundreds of orders ahead. Requiring price to trade *through*
+   * the level, rather than merely touch it, is the cheap approximation: a touch
+   * that bounces is assumed to have filled the queue in front and not us.
+   */
+  fillThroughTicks?: number;
+  funding?: FundingOptions;
   events?: BrokerEvents;
 }
 
@@ -43,6 +70,8 @@ export class PaperBroker {
 
   private realizedPnl = 0;
   private feesPaid = 0;
+  private fundingPaid = 0;
+  private lastFundingCheck = new Map<string, number>();
   private orderSeq = 0;
   private closedTrades: ClosedTrade[] = [];
 
@@ -70,6 +99,11 @@ export class PaperBroker {
 
   get fees(): number {
     return this.feesPaid;
+  }
+
+  /** Total funding settled, a cost when positive. */
+  get funding(): number {
+    return this.fundingPaid;
   }
 
   getPosition(symbol: string): Position | undefined {
@@ -106,9 +140,52 @@ export class PaperBroker {
    */
   onTrade(symbol: string, trade: RawTrade) {
     this.lastPrice.set(symbol, trade.price);
+    this.settleFunding(symbol, trade);
     this.fillCrossedLimits(symbol, trade);
     this.mark(symbol, trade.price);
     this.checkBrackets(symbol, trade);
+  }
+
+  /**
+   * Charge funding on every settlement the tape has passed.
+   *
+   * A grid holds inventory across settlements by design, so leaving this out
+   * would quietly hand it free carry — exactly the kind of flattery a backtest
+   * must not produce.
+   */
+  private settleFunding(symbol: string, trade: RawTrade) {
+    const cfg = this.opts.funding;
+    if (!cfg) return;
+
+    const last = this.lastFundingCheck.get(symbol);
+    this.lastFundingCheck.set(symbol, trade.time);
+    if (last === undefined) return;
+
+    const position = this.positions.get(symbol);
+    if (!position) return;
+
+    const settlements = cfg.settlementsBetween?.(symbol, last, trade.time) ?? [];
+    const due = settlements.length > 0 ? settlements : this.syntheticSettlements(cfg, last, trade.time);
+
+    for (const s of due) {
+      const notional = position.qty * trade.price;
+      // A positive rate is paid by longs to shorts.
+      const cost = notional * s.rate * (position.direction === 'long' ? 1 : -1);
+      position.fundingPaid += cost;
+      this.fundingPaid += cost;
+      this.realizedPnl -= cost;
+    }
+  }
+
+  /** Used only for a symbol with no collected schedule. */
+  private syntheticSettlements(cfg: FundingOptions, after: number, upTo: number) {
+    const out: Array<{ ts: number; rate: number }> = [];
+    const first = Math.floor(after / cfg.fallbackIntervalMs) + 1;
+    const last = Math.floor(upTo / cfg.fallbackIntervalMs);
+    for (let i = first; i <= last; i++) {
+      out.push({ ts: i * cfg.fallbackIntervalMs, rate: cfg.fallbackRate });
+    }
+    return out;
   }
 
   private mark(symbol: string, price: number) {
@@ -175,6 +252,7 @@ export class PaperBroker {
       takeProfit: params.takeProfit,
       entryReason: params.reason,
       entryFee: fee,
+      fundingPaid: 0,
       unrealizedPnl: 0,
       markPrice: fill.price,
       maxFavorable: 0,
@@ -273,8 +351,9 @@ export class PaperBroker {
       takeProfit: position.takeProfit,
       grossPnl,
       fees,
-      netPnl: grossPnl - fees,
-      rMultiple: riskTotal && riskTotal > 0 ? (grossPnl - fees) / riskTotal : undefined,
+      funding: position.fundingPaid,
+      netPnl: grossPnl - fees - position.fundingPaid,
+      rMultiple: riskTotal && riskTotal > 0 ? (grossPnl - fees - position.fundingPaid) / riskTotal : undefined,
       exitReason: reason,
       entryReason: position.entryReason,
     };
@@ -332,11 +411,13 @@ export class PaperBroker {
     if (!list || list.length === 0) return;
 
     const stillResting: RestingOrder[] = [];
+    const through = (this.opts.fillThroughTicks ?? 0) * (this.opts.tickSize?.[symbol] ?? 0);
     for (const order of list) {
-      // A buy limit needs a seller hitting down through it, and vice versa.
+      // A buy limit needs a seller hitting down through it, and vice versa —
+      // and price must clear the level, not merely reach it.
       const crossed =
-        (order.side === 'buy' && trade.side === 'sell' && trade.price <= order.price) ||
-        (order.side === 'sell' && trade.side === 'buy' && trade.price >= order.price);
+        (order.side === 'buy' && trade.side === 'sell' && trade.price <= order.price - through) ||
+        (order.side === 'sell' && trade.side === 'buy' && trade.price >= order.price + through);
 
       if (!crossed || this.positions.has(symbol)) {
         stillResting.push(order);
@@ -361,6 +442,7 @@ export class PaperBroker {
         takeProfit: order.bracket?.takeProfit,
         entryReason: order.bracket?.entryReason,
         entryFee: fee,
+        fundingPaid: 0,
         unrealizedPnl: 0,
         markPrice: order.price,
         maxFavorable: 0,
