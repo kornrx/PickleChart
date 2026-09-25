@@ -1,0 +1,31 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "lib": [
+      "ES2022",
+      "DOM"
+    ],
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "types": [
+      "node"
+    ],
+    "skipLibCheck": true,
+    "resolveJsonModule": true,
+    "noEmit": true,
+    "strict": true,
+    "noUnusedLocals": true,
+    "noUnusedParameters": true,
+    "noFallthroughCasesInSwitch": true
+  },
+  "include": [
+    "server",
+    "src/types",
+    "src/services"
+  ],
+  "exclude": [
+    "src/services/audioAlert.ts",
+    "src/services/settingsStorage.ts",
+    "src/services/tradingClient.ts"
+  ]
+}

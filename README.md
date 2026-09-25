@@ -187,6 +187,111 @@ PickleChart supports real-time streaming for premier crypto and macro perpetual 
 
 ---
 
+## 📄 Paper Trading Engine
+
+A simulated trading stack that runs on the same order-flow signals the chart
+draws. It is **paper only**: no exchange credentials are read, no API keys are
+stored, and no real orders are ever placed.
+
+### Quick start
+
+```bash
+# terminal 1 — collector, strategy, paper broker
+npm run paper
+
+# terminal 2 — the chart UI (open the "Paper" tab in the right panel)
+npm run dev
+```
+
+Once ticks have been collected, replay them through the same code:
+
+```bash
+npm run backtest
+npm run backtest -- --symbols=BTCUSDT --from=2026-09-24T00:00:00Z
+```
+
+Run the broker and risk assertions:
+
+```bash
+npm run selftest
+```
+
+### How it fits together
+
+```
+Binance WS ──┬─► MarketContext ──► Strategy ──► RiskManager ──► PaperBroker
+             │   (LiquidityEngine,   (signal)     (sizing,        (simulated
+             │    CandleAggregator,               kill switch)     fills)
+             │    TradeClusterEngine)                  │
+             └─► SQLite (ticks, book snapshots, candles, orders, equity)
+                                                       │
+                              UI "Paper" tab ◄── WebSocket :8787 ──┘
+```
+
+The server imports `LiquidityEngine`, `CandleAggregator` and
+`TradeClusterEngine` directly from `src/services`, so the strategy reacts to
+exactly what the chart renders. Live and replay share one `TradingEngine`;
+only the tick source differs, and nothing in the decision path reads the wall
+clock — replay drives the clock from the tape.
+
+| File | Role |
+| :--- | :--- |
+| `server/index.ts` | Live collector, feeds, WebSocket telemetry, control commands |
+| `server/marketContext.ts` | Per-symbol analytical state, shared by live and backtest |
+| `server/tradingEngine.ts` | Data → strategy → risk → broker, plus journalling |
+| `server/paperBroker.ts` | Simulated fills, brackets, fees, position and PnL accounting |
+| `server/riskManager.ts` | Position sizing, daily loss limit, drawdown kill switch |
+| `server/strategy/sweepReversal.ts` | Reference order-flow strategy |
+| `server/backtest.ts` | Replays stored ticks and prints a performance report |
+| `server/db.ts` | SQLite journal (`node:sqlite`, no native build needed) |
+
+### Fill model
+
+Deliberately pessimistic, so paper results are not flattered:
+
+- Market orders **walk the visible depth** for a size-weighted price and pay the taker fee.
+- A stop that gaps fills at the **gapped price**, not at the stop level.
+- A resting limit fills only once an aggressor **actually trades through it**, and pays the maker fee.
+- A position can never be stopped out on its own entry tick.
+
+It still differs from live trading: the book is a 20-level snapshot, queue
+position is not modelled, and there is no funding, partial-fill or latency
+simulation.
+
+### Risk controls
+
+| Control | Default | Behaviour |
+| :--- | :--- | :--- |
+| Risk per trade | 0.5% of equity | Size derived from the stop distance |
+| Max leverage | 5x | Caps notional when the stop is tight |
+| Max open positions | 2 | Across all symbols |
+| Daily loss limit | 3% | Blocks new entries, resets at UTC midnight |
+| Drawdown kill switch | 15% | Latches for the run; cleared only by hand |
+| Cooldown after a loss | 60s | Per symbol |
+
+Override without editing code: `PC_EQUITY`, `PC_RISK_PER_TRADE`,
+`PC_MAX_DAILY_LOSS`, `PC_MAX_DRAWDOWN`, `PC_SYMBOLS`, `PC_DB`, `PC_WS_PORT`.
+
+### The reference strategy
+
+`sweep-reversal` looks for an aggressor running price through a resting pool of
+stops, failing to follow through, and the opposite side taking control: a swept
+liquidity pool, a reclaim of the swept level, an aggressor-delta flip, and a
+supporting book imbalance. The stop goes beyond the sweep extreme and the
+target is the nearest un-swept pool in the direction of travel.
+
+**No claim is made that it is profitable.** It exists as a worked, testable
+example of consuming the order-flow signals — measure it with the backtester
+and replace it with your own rules. Implement the `Strategy` interface in
+`server/strategy/types.ts` and swap it in `server/index.ts`.
+
+### Before anything touches real money
+
+Paper results are not live results. If you ever extend this to live execution,
+the API key belongs in a server-side `.env` that is never imported by the Vite
+bundle — anything under `src/` ships to the browser. Start on Binance testnet,
+and size down hard.
+
 ## 🤝 Contributing
 
 Contributions from the open-source community are warmly welcomed!

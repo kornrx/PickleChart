@@ -29,3 +29,12 @@ Thumbs.db
 .env
 .env.*
 !.env.example
+
+# paper-trading tick database
+data/
+
+# collector logs
+logs/
+
+# generated reports
+reports/

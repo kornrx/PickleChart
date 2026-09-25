@@ -11,6 +11,7 @@ import { CanvasChart } from './components/Chart/CanvasChart';
 import { BigTradeTape } from './components/BigTrades/BigTradeTape';
 import { DepthOfMarket } from './components/DOM/DepthOfMarket';
 import { LiquidityRadar } from './components/Liquidity/LiquidityRadar';
+import { TradingPanel } from './components/Trading/TradingPanel';
 import { OrderFlowStats } from './components/OrderFlow/OrderFlowStats';
 import { XPTitleBar } from './components/XP/XPTitleBar';
 import { XPStartMenu } from './components/XP/XPStartMenu';
@@ -56,7 +57,7 @@ export function App() {
   const [sweptEvents, setSweptEvents] = useState<SweptOrderEvent[]>([]);
 
   // Panel View Mode: 'split' | 'dom' | 'tape' | 'liquidity'
-  const [panelView, setPanelView] = useState<'split' | 'dom' | 'tape' | 'liquidity'>('split');
+  const [panelView, setPanelView] = useState<'split' | 'dom' | 'tape' | 'liquidity' | 'trading'>('split');
 
   // Order Flow metrics
   const [sessionBuyVol, setSessionBuyVol] = useState<number>(0);
@@ -492,6 +493,17 @@ export function App() {
                   </span>
                 )}
               </button>
+              <button
+                onClick={() => setPanelView('trading')}
+                className={`py-1 px-2.5 rounded-t-[3px] text-[11px] font-sans transition-all flex items-center gap-1 ${
+                  panelView === 'trading'
+                    ? 'bg-[#ece9d8] text-black font-bold border-t-2 border-t-[#0055ea] border-x border-[#919b9c] -mb-[1px] z-10 shadow-[0_-1px_2px_rgba(0,0,0,0.08)]'
+                    : 'bg-[#dfdbcc] hover:bg-[#eae7d8] text-[#333333] border-t border-x border-[#aca899] mb-0'
+                }`}
+                title="Paper Trading — simulated fills, no exchange account"
+              >
+                <span>Paper</span>
+              </button>
             </div>
 
             {/* Panel Body */}
@@ -541,6 +553,8 @@ export function App() {
                 <BigTradeTape trades={bigTrades} symbol={symbol} />
               </div>
             )}
+
+            {panelView === 'trading' && <TradingPanel />}
           </aside>
         </div>
 
